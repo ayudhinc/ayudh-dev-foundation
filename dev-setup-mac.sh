@@ -10,7 +10,7 @@ set -euo pipefail
 # Usage:
 #   chmod +x dev-setup-mac.sh
 #   ./dev-setup-mac.sh
-#   ./dev-setup-mac.sh --docker=colima
+#   ./dev-setup-mac.sh --docker=orbstack
 # ------------------------------------------------------------
 
 # ---------- styling ----------
@@ -32,31 +32,6 @@ confirm() {
   [[ "${ans:-}" =~ ^[Yy]$ ]]
 }
 
-choose_one() {
-  local prompt="$1"
-  shift
-  local options=("$@")
-  local i=1
-  echo "$prompt"
-  for opt in "${options[@]}"; do
-    echo "  $i) $opt"
-    i=$((i+1))
-  done
-  local choice=""
-  while true; do
-    read -r -p "Select [1-${#options[@]}] (or press Enter to skip): " choice
-    if [[ -z "${choice:-}" ]]; then
-      echo ""
-      return 1
-    fi
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#options[@]} )); then
-      echo "${options[choice-1]}"
-      return 0
-    fi
-    echo "Invalid choice."
-  done
-}
-
 append_if_missing() {
   local line="$1"
   local file="$2"
@@ -66,12 +41,43 @@ append_if_missing() {
 
 is_apple_silicon() { [[ "$(uname -m)" == "arm64" ]]; }
 
-brew_shellenv_eval() {
-  if is_apple_silicon; then
-    eval "$(/opt/homebrew/bin/brew shellenv)"
-  else
-    eval "$(/usr/local/bin/brew shellenv)"
+# ---------- Homebrew bootstrap (robust) ----------
+# Why this exists:
+# - On a fresh Mac, brew may be installed but NOT on PATH for non-login shells.
+# - Using `command -v brew` can incorrectly report "missing".
+# This block finds brew in standard locations and fixes PATH for this script process.
+BREW_BIN=""
+
+detect_brew() {
+  if command -v brew >/dev/null 2>&1; then
+    BREW_BIN="$(command -v brew)"
+    return 0
   fi
+  if [[ -x "/opt/homebrew/bin/brew" ]]; then
+    BREW_BIN="/opt/homebrew/bin/brew"
+    return 0
+  fi
+  if [[ -x "/usr/local/bin/brew" ]]; then
+    BREW_BIN="/usr/local/bin/brew"
+    return 0
+  fi
+  return 1
+}
+
+have_brew() { [[ -n "${BREW_BIN:-}" && -x "${BREW_BIN:-}" ]]; }
+
+brew_eval_shellenv() {
+  # shellcheck disable=SC2046
+  eval "$("${BREW_BIN}" shellenv)"
+}
+
+brew_cmd() {
+  "${BREW_BIN}" "$@"
+}
+
+brew_has_cask() {
+  have_brew || return 1
+  brew_cmd list --cask 2>/dev/null | grep -qx "$1"
 }
 
 # ---------- args ----------
@@ -100,7 +106,18 @@ if [[ "$(uname)" != "Darwin" ]]; then
   exit 1
 fi
 
+# IMPORTANT: Detect brew early (if present) and fix PATH for THIS script run.
+if detect_brew; then
+  brew_eval_shellenv
+fi
+
 log "Interactive macOS frontend + backend dev setup"
+
+# Guardrail: running entire script with sudo breaks PATH/home assumptions.
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  warn "You are running this script as root (sudo). This can hide Homebrew and confuse installs."
+  warn "Recommended: run as your normal user (no sudo), and only enter sudo when prompted."
+fi
 
 # ---------- step: Xcode CLT ----------
 log "Step: Xcode Command Line Tools"
@@ -118,27 +135,35 @@ fi
 
 # ---------- step: Homebrew ----------
 log "Step: Homebrew"
-if need_cmd brew; then
-  log "Homebrew already installed."
-  brew_shellenv_eval || true
+if have_brew; then
+  log "Homebrew already installed at: ${BREW_BIN}"
 else
   warn "Homebrew not found."
   if confirm "Install Homebrew?"; then
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    # Re-detect and init PATH
+    if ! detect_brew; then
+      err "Homebrew install completed but brew not found in expected locations."
+      exit 1
+    fi
+    brew_eval_shellenv
+
+    # Persist PATH for future terminals
     if is_apple_silicon; then
       append_if_missing 'eval "$(/opt/homebrew/bin/brew shellenv)"' "$HOME/.zprofile"
     else
       append_if_missing 'eval "$(/usr/local/bin/brew shellenv)"' "$HOME/.zprofile"
     fi
-    brew_shellenv_eval
   else
     warn "Skipping Homebrew. Most steps require it."
   fi
 fi
 
-if need_cmd brew; then
+# Refresh PATH once more (covers cases where brew was installed mid-run)
+if have_brew; then
+  brew_eval_shellenv
   if confirm "Run 'brew update'?"; then
-    brew update
+    brew_cmd update
   else
     warn "Skipping brew update."
   fi
@@ -146,17 +171,18 @@ fi
 
 # ---------- step: core packages ----------
 log "Step: Core CLI packages (git, jq, ripgrep, fd, fzf, direnv, etc.)"
-if need_cmd brew; then
+if have_brew; then
   if confirm "Install core CLI packages via Homebrew?"; then
-    brew install \
+    brew_cmd install \
       git curl wget jq openssl readline sqlite \
       gnu-sed coreutils ca-certificates \
       ripgrep fd fzf tmux tree watch htop \
       direnv shellcheck
+
     # Optional fzf completion/keybinds
-    if [[ -f "$(brew --prefix)/opt/fzf/install" ]]; then
+    if [[ -f "$(brew_cmd --prefix)/opt/fzf/install" ]]; then
       if confirm "Enable fzf key bindings + shell completion?"; then
-        "$(brew --prefix)/opt/fzf/install" --key-bindings --completion --no-update-rc >/dev/null 2>&1 || true
+        "$(brew_cmd --prefix)/opt/fzf/install" --key-bindings --completion --no-update-rc >/dev/null 2>&1 || true
       fi
     fi
   else
@@ -168,6 +194,7 @@ fi
 
 # ---------- step: Git config ----------
 log "Step: Git configuration"
+# Ensure PATH includes brew bins for this script; if brew exists but PATH was missing earlier, git may now be found.
 if need_cmd git; then
   if confirm "Set global git defaults (main branch, pull behavior, autocrlf)?"; then
     git config --global init.defaultBranch main
@@ -181,7 +208,8 @@ if need_cmd git; then
     git config --global user.email "$GIT_EMAIL"
   fi
 else
-  warn "git not found; skipping git config."
+  warn "git not found on PATH; skipping git config."
+  warn "If you installed git via brew above, open a NEW terminal or re-run this script."
 fi
 
 # ---------- step: SSH key ----------
@@ -206,10 +234,6 @@ fi
 # ---------- step: Node via nvm ----------
 log "Step: Node.js via nvm"
 if confirm "Install nvm + Node LTS + Corepack (pnpm/yarn)?"; then
-  if ! need_cmd brew; then
-    warn "Homebrew missing; will still try nvm installer directly."
-  fi
-
   # Install nvm if missing
   if [[ ! -d "$HOME/.nvm" ]]; then
     curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
@@ -245,8 +269,8 @@ fi
 # ---------- step: Python via pyenv + Poetry ----------
 log "Step: Python via pyenv + Poetry"
 if confirm "Install pyenv + Python 3.12 + Poetry (project .venv)?"; then
-  if need_cmd brew; then
-    brew install pyenv xz
+  if have_brew; then
+    brew_cmd install pyenv xz
   else
     warn "Homebrew missing; skipping pyenv install."
   fi
@@ -258,12 +282,13 @@ if confirm "Install pyenv + Python 3.12 + Poetry (project .venv)?"; then
 
   export PYENV_ROOT="$HOME/.pyenv"
   export PATH="$PYENV_ROOT/bin:$PATH"
+
   if need_cmd pyenv; then
     eval "$(pyenv init -)" || true
     PY_VER="3.12.8"
 
     if confirm "Install Python ${PY_VER} via pyenv (can take time)?"; then
-      if pyenv versions --bare | grep -q "^${PY_VER}$"; then
+      if pyenv versions --bare | grep -qx "${PY_VER}"; then
         log "Python ${PY_VER} already installed in pyenv."
       else
         pyenv install "${PY_VER}"
@@ -303,13 +328,13 @@ fi
 
 # ---------- step: Databases (brew) ----------
 log "Step: Postgres + Redis (Brew services)"
-if need_cmd brew; then
+if have_brew; then
   if confirm "Install Postgres 16 + Redis via Homebrew?"; then
-    brew install postgresql@16 redis
+    brew_cmd install postgresql@16 redis
 
     if confirm "Start Postgres + Redis now using brew services (runs in background)?"; then
-      brew services start postgresql@16 || true
-      brew services start redis || true
+      brew_cmd services start postgresql@16 || true
+      brew_cmd services start redis || true
       log "Started Postgres + Redis (brew services)."
     else
       warn "Skipping starting services. You can start later with:"
@@ -324,7 +349,7 @@ else
 fi
 
 # ---------- step: Docker runtime selection ----------
-log "Step: Docker runtime (choose one)"
+log "Step: Docker runtime"
 
 # Validate flag if provided
 if [[ -n "${DOCKER_MODE:-}" ]]; then
@@ -341,23 +366,31 @@ if [[ "${DOCKER_MODE:-}" == "skip" ]]; then
   warn "Docker step skipped due to --docker=skip."
 else
   if [[ -z "${DOCKER_MODE:-}" ]]; then
-    # prompt user choice
-    if choice="$(choose_one "Pick a Docker runtime to install:" "Docker Desktop" "Colima (headless, lightweight)" "OrbStack (alternative app) ")" ; then
-      case "$choice" in
-        "Docker Desktop") DOCKER_MODE="desktop" ;;
-        "Colima (headless, lightweight)") DOCKER_MODE="colima" ;;
-        "OrbStack (alternative app)") DOCKER_MODE="orbstack" ;;
-      esac
-    else
-      DOCKER_MODE="skip"
-      warn "Docker runtime not selected; skipping."
-    fi
+    echo ""
+    echo "Pick a Docker runtime to install:"
+    echo "  1) Docker Desktop  (most compatible / common default)"
+    echo "  2) Colima          (lightweight, CLI-only runtime)"
+    echo "  3) OrbStack        (fast Docker Desktop alternative)"
+    echo "  Enter) Skip Docker"
+    echo ""
+    read -r -p "Select [1-3] (or press Enter to skip): " choice
+    case "${choice:-}" in
+      1) DOCKER_MODE="desktop" ;;
+      2) DOCKER_MODE="colima" ;;
+      3) DOCKER_MODE="orbstack" ;;
+      "") DOCKER_MODE="skip" ;;
+      *) warn "Invalid choice; skipping Docker."; DOCKER_MODE="skip" ;;
+    esac
   fi
 
   if [[ "${DOCKER_MODE}" == "desktop" ]]; then
-    if need_cmd brew; then
+    if have_brew; then
       if confirm "Install Docker Desktop (cask: docker-desktop)?"; then
-        brew install --cask docker-desktop
+        if brew_has_cask docker-desktop; then
+          log "Docker Desktop already installed."
+        else
+          brew_cmd install --cask docker-desktop
+        fi
         warn "After install: open Docker Desktop once to finish permissions/setup."
       else
         warn "Skipped Docker Desktop."
@@ -366,9 +399,9 @@ else
       warn "Homebrew missing; cannot install Docker Desktop via brew."
     fi
   elif [[ "${DOCKER_MODE}" == "colima" ]]; then
-    if need_cmd brew; then
-      if confirm "Install Colima + Docker CLI (recommended lightweight setup)?"; then
-        brew install colima docker docker-compose
+    if have_brew; then
+      if confirm "Install Colima + Docker CLI + docker-compose (lightweight setup)?"; then
+        brew_cmd install colima docker docker-compose
         if confirm "Start Colima now? (colima start)"; then
           colima start
           log "Colima started. Docker should work now."
@@ -382,10 +415,20 @@ else
       warn "Homebrew missing; cannot install Colima."
     fi
   elif [[ "${DOCKER_MODE}" == "orbstack" ]]; then
-    if need_cmd brew; then
-      if confirm "Install OrbStack (cask)?"; then
-        brew install --cask orbstack
-        warn "After install: open OrbStack once to initialize."
+    if have_brew; then
+      if confirm "Install OrbStack (cask: orbstack)?"; then
+        if brew_has_cask orbstack; then
+          log "OrbStack already installed."
+        else
+          brew_cmd install --cask orbstack
+        fi
+        # Verify .app presence (brew can install into /Applications)
+        if [[ -d "/Applications/OrbStack.app" ]] || [[ -d "$HOME/Applications/OrbStack.app" ]]; then
+          log "OrbStack app detected."
+        else
+          warn "OrbStack installed via brew, but OrbStack.app not found in /Applications. If needed: brew reinstall --cask orbstack"
+        fi
+        warn "After install: open OrbStack once to initialize (then: docker version)."
       else
         warn "Skipped OrbStack."
       fi
@@ -393,13 +436,26 @@ else
       warn "Homebrew missing; cannot install OrbStack."
     fi
   fi
+
+  # Non-fatal quick check
+  echo ""
+  log "Docker quick check (non-fatal)"
+  if need_cmd docker; then
+    docker version >/dev/null 2>&1 && log "docker CLI works (docker version succeeded)" || warn "docker CLI present but runtime not initialized yet (open OrbStack/Desktop or start Colima)"
+  else
+    warn "docker command not found yet. This is normal until you install Desktop/Colima or OrbStack provides it."
+  fi
 fi
 
 # ---------- step: VS Code ----------
 log "Step: VS Code"
-if need_cmd brew; then
+if have_brew; then
   if confirm "Install Visual Studio Code (cask)?"; then
-    brew install --cask visual-studio-code
+    if brew_has_cask visual-studio-code; then
+      log "VS Code already installed."
+    else
+      brew_cmd install --cask visual-studio-code
+    fi
     warn "To enable 'code' command: VS Code → Cmd+Shift+P → Install 'code' command in PATH"
   else
     warn "Skipping VS Code."
